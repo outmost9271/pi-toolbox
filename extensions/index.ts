@@ -7,7 +7,15 @@ import {
 	DynamicBorder,
 	getSettingsListTheme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
+import {
+	type AutocompleteItem,
+	type AutocompleteProvider,
+	type AutocompleteSuggestions,
+	Container,
+	type SettingItem,
+	SettingsList,
+	Text,
+} from "@earendil-works/pi-tui";
 
 const TOOLBOX_ROOT = process.env.PI_TOOLBOX_ROOT ?? "/agent-pi/tools";
 const CONFIG_FILE_NAME = "toolbox.json";
@@ -272,6 +280,78 @@ function formatStatus(capabilities: Capability[], enabled: ReadonlySet<string>, 
 	return lines.join("\n");
 }
 
+function getToolboxArgumentCompletions(
+	argumentPrefix: string,
+	capabilities: Capability[],
+	enabledIds: ReadonlySet<string>,
+): AutocompleteItem[] | null {
+	const actions = ["list", "status", "enable", "disable"];
+	if (!argumentPrefix.includes(" ")) {
+		const query = argumentPrefix.trim();
+		const matches = actions.filter((action) => action.startsWith(query));
+		return matches.length > 0
+			? matches.map((action) => ({
+					value: action === "enable" || action === "disable" ? `${action} ` : action,
+					label: action,
+				}))
+			: null;
+	}
+
+	const match = argumentPrefix.match(/^(enable|disable)\s+(.*)$/);
+	if (!match) return null;
+	const action = match[1];
+	const query = match[2].trim().toLowerCase();
+	const candidates = capabilities.filter((capability) =>
+		action === "enable" ? !enabledIds.has(capability.id) : enabledIds.has(capability.id),
+	);
+	const filtered = candidates.filter((capability) =>
+		`${capability.id} ${capability.name} ${capability.description}`.toLowerCase().includes(query),
+	);
+	return filtered.length > 0
+		? filtered.map((capability) => ({
+				value: `${action} ${capability.id}`,
+				label: capability.id,
+				description: capability.description,
+			}))
+		: null;
+}
+
+function getToolboxArgumentPrefix(
+	lines: string[],
+	cursorLine: number,
+	cursorCol: number,
+): string | undefined {
+	const line = lines[cursorLine] ?? "";
+	const beforeCursor = line.slice(0, cursorCol);
+	const match = beforeCursor.match(/^\/toolbox\s(.*)$/);
+	return match?.[1];
+}
+
+function createToolboxAutocompleteProvider(
+	current: AutocompleteProvider,
+	getCompletions: (argumentPrefix: string) => AutocompleteItem[] | null,
+): AutocompleteProvider {
+	return {
+		triggerCharacters: current.triggerCharacters,
+		async getSuggestions(lines, cursorLine, cursorCol, options): Promise<AutocompleteSuggestions | null> {
+			const argumentPrefix = getToolboxArgumentPrefix(lines, cursorLine, cursorCol);
+			if (argumentPrefix === undefined) {
+				return current.getSuggestions(lines, cursorLine, cursorCol, options);
+			}
+
+			const items = getCompletions(argumentPrefix);
+			return items && items.length > 0 ? { items, prefix: argumentPrefix } : null;
+		},
+		applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+			return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+		},
+		shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+			if (getToolboxArgumentPrefix(lines, cursorLine, cursorCol) !== undefined) return true;
+			return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+		},
+	};
+}
+
 export default function toolboxExtension(pi: ExtensionAPI): void {
 	let runtimeCwd = process.cwd();
 	let capabilities: Capability[] = [];
@@ -407,6 +487,13 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await refreshState(ctx.cwd);
+		if (ctx.mode === "tui") {
+			ctx.ui.addAutocompleteProvider((current) =>
+				createToolboxAutocompleteProvider(current, (argumentPrefix) =>
+					getToolboxArgumentCompletions(argumentPrefix, capabilities, enabledIds),
+				),
+			);
+		}
 		runtimeActive = ctx.isProjectTrusted() || explicitlyApprovedCwds.has(resolve(ctx.cwd));
 		if (runtimeActive) enableBashPaths(ctx.cwd);
 		else if (enabledIds.size > 0) ctx.ui.notify("Toolbox 配置因项目未受信任而未加载", "warning");
@@ -428,32 +515,8 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("toolbox", {
 		description: "启用或关闭当前项目的共享能力",
-		getArgumentCompletions: (argumentPrefix) => {
-			const actions = ["list", "status", "enable", "disable"];
-			if (!argumentPrefix.includes(" ")) {
-				const query = argumentPrefix.trim();
-				const matches = actions.filter((action) => action.startsWith(query));
-				return matches.length > 0 ? matches.map((action) => ({ value: action, label: action })) : null;
-			}
-
-			const match = argumentPrefix.match(/^(enable|disable)\s+(.*)$/);
-			if (!match) return null;
-			const action = match[1];
-			const query = match[2].trim().toLowerCase();
-			const candidates = capabilities.filter((capability) =>
-				action === "enable" ? !enabledIds.has(capability.id) : enabledIds.has(capability.id),
-			);
-			const filtered = candidates.filter((capability) =>
-				`${capability.id} ${capability.name} ${capability.description}`.toLowerCase().includes(query),
-			);
-			return filtered.length > 0
-				? filtered.map((capability) => ({
-						value: `${action} ${capability.id}`,
-						label: capability.id,
-						description: capability.description,
-					}))
-				: null;
-		},
+		getArgumentCompletions: (argumentPrefix) =>
+			getToolboxArgumentCompletions(argumentPrefix, capabilities, enabledIds),
 		handler: async (args, ctx) => {
 			const input = args.trim();
 			if (!input) {
