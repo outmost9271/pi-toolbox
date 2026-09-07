@@ -488,6 +488,9 @@ function getToolboxArgumentCompletions(
 	globalEnabled: ReadonlySet<string>,
 	projectOverrides: ReadonlyMap<string, ProjectOverride>,
 ): AutocompleteItem[] | null {
+	// Match command parsing while retaining a trailing separator for chained completion.
+	// Keep the provider's original prefix unchanged so insertion replaces the full input.
+	argumentPrefix = argumentPrefix.replace(/^[ \t]+/, "").replace(/[ \t]+/g, " ");
 	if (!argumentPrefix.includes(" ")) {
 		const query = argumentPrefix.trim();
 		const topLevel = ["project", "global", ...actionsForScope("project")].filter((value) => value.startsWith(query));

@@ -1,6 +1,9 @@
 {
   "name": "pi-toolbox",
-  "version": "0.2.0",
+  "version": "0.2.1",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
   "description": "按全局默认值和项目覆盖启用集中管理的 Pi Skills 与命令行能力",
   "type": "module",
   "keywords": [
