@@ -1,0 +1,19 @@
+{
+  "name": "pi-toolbox",
+  "version": "0.1.0",
+  "description": "按项目启用集中管理的 Pi Skills 和命令行能力",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
