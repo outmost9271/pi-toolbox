@@ -64,13 +64,6 @@ interface LoadedProjectConfig {
 	migratedFromV1: boolean;
 }
 
-interface ToolboxProcessState {
-	__piToolboxApprovedCwds?: Set<string>;
-}
-
-const processState = globalThis as typeof globalThis & ToolboxProcessState;
-const explicitlyApprovedCwds = (processState.__piToolboxApprovedCwds ??= new Set<string>());
-
 function globalConfigPath(): string {
 	return join(getAgentDir(), CONFIG_FILE_NAME);
 }
@@ -369,11 +362,9 @@ function computeEffectiveEnabled(
 	capabilities: Capability[],
 	globalEnabled: ReadonlySet<string>,
 	projectOverrides: ReadonlyMap<string, ProjectOverride>,
-	applyProjectOverrides: boolean,
 ): Set<string> {
 	const knownIds = new Set(capabilities.map((capability) => capability.id));
 	const effective = new Set([...globalEnabled].filter((id) => knownIds.has(id)));
-	if (!applyProjectOverrides) return effective;
 	for (const [id, state] of projectOverrides) {
 		if (!knownIds.has(id)) continue;
 		if (state === "enabled") effective.add(id);
@@ -411,17 +402,14 @@ function formatProjectStatus(
 	capabilities: Capability[],
 	globalEnabled: ReadonlySet<string>,
 	projectOverrides: ReadonlyMap<string, ProjectOverride>,
-	applyProjectOverrides: boolean,
 ): string {
 	if (capabilities.length === 0) return `未在 ${TOOLBOX_ROOT} 中发现能力`;
-	const effective = computeEffectiveEnabled(capabilities, globalEnabled, projectOverrides, applyProjectOverrides);
+	const effective = computeEffectiveEnabled(capabilities, globalEnabled, projectOverrides);
 	const lines = capabilities.map((capability) => {
 		const globalOn = globalEnabled.has(capability.id);
 		const override = projectOverrides.get(capability.id);
 		let source: string;
-		if (!applyProjectOverrides && override) {
-			source = `项目覆盖未加载；当前按全局${globalOn ? "开启" : "关闭"}`;
-		} else if (override === "enabled") {
+		if (override === "enabled") {
 			source = globalOn ? "项目明确开启（与全局一致）" : "项目明确开启（覆盖全局关闭）";
 		} else if (override === "disabled") {
 			source = globalOn ? "项目明确关闭（覆盖全局开启）" : "项目明确关闭（与全局一致）";
@@ -430,9 +418,6 @@ function formatProjectStatus(
 		}
 		return `${effective.has(capability.id) ? "●" : "○"} ${capability.id} — ${source}`;
 	});
-	if (!applyProjectOverrides && projectOverrides.size > 0) {
-		lines.unshift("当前项目尚未受信任，项目覆盖本次未加载。", "");
-	}
 	return lines.join("\n");
 }
 
@@ -585,16 +570,13 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 	let globalEnabledIds = new Set<string>();
 	let projectOverrides = new Map<string, ProjectOverride>();
 	let effectiveEnabledIds = new Set<string>();
-	let projectOverridesActive = false;
 	let discoveryWarnings: string[] = [];
 
-	function recomputeEffective(applyProjectOverrides: boolean): void {
-		projectOverridesActive = applyProjectOverrides;
+	function recomputeEffective(): void {
 		effectiveEnabledIds = computeEffectiveEnabled(
 			capabilities,
 			globalEnabledIds,
 			projectOverrides,
-			applyProjectOverrides,
 		);
 	}
 
@@ -627,10 +609,6 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		return loadedProject;
 	}
 
-	function isProjectOverrideAllowed(ctx: { cwd: string; isProjectTrusted(): boolean }): boolean {
-		return ctx.isProjectTrusted() || explicitlyApprovedCwds.has(resolve(ctx.cwd));
-	}
-
 	function enableBashPaths(cwd: string): void {
 		const binPaths = [
 			...new Set(
@@ -654,25 +632,10 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		pi.registerTool(bashTool);
 	}
 
-	async function approveExplicitProjectChange(ctx: ExtensionCommandContext): Promise<boolean> {
-		if (isProjectOverrideAllowed(ctx)) return true;
-		if (!ctx.hasUI) return false;
-		const approved = await ctx.ui.confirm(
-			"启用当前项目的 Toolbox 配置？",
-			`${ctx.cwd}\n\n项目覆盖可以访问或关闭全局共享能力及其认证。`,
-		);
-		if (approved) explicitlyApprovedCwds.add(resolve(ctx.cwd));
-		return approved;
-	}
-
 	async function persistProjectAndReload(
 		ctx: ExtensionCommandContext,
 		nextOverrides: Map<string, ProjectOverride>,
 	): Promise<void> {
-		if (!(await approveExplicitProjectChange(ctx))) {
-			ctx.ui.notify("未修改项目 Toolbox 配置", "warning");
-			return;
-		}
 		const path = projectConfigPath(ctx.cwd);
 		const excludeWarning = await ensureLocalGitExclude(pi, ctx.cwd, path);
 		await writeProjectConfig(ctx.cwd, nextOverrides);
@@ -810,20 +773,6 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		else if (selected === globalChoice) await showGlobalSelector(ctx);
 	}
 
-	pi.on("project_trust", async (event, ctx) => {
-		const loaded = await readProjectConfig(event.cwd);
-		const overrides = Object.entries(loaded.config.overrides);
-		if (!loaded.exists || overrides.length === 0 || !ctx.hasUI) return { trusted: "undecided" };
-		const summary = overrides
-			.map(([id, state]) => `${id}=${state === "enabled" ? "开启" : "关闭"}`)
-			.join(", ");
-		const trusted = await ctx.ui.confirm(
-			"信任项目的 Toolbox 配置？",
-			`${event.cwd}\n\n项目请求覆盖：${summary}。`,
-		);
-		return { trusted: trusted ? "yes" : "no", remember: true };
-	});
-
 	pi.on("session_start", async (_event, ctx) => {
 		await refreshState(ctx.cwd);
 		if (ctx.mode === "tui") {
@@ -838,17 +787,14 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 				),
 			);
 		}
-		recomputeEffective(isProjectOverrideAllowed(ctx));
+		recomputeEffective();
 		enableBashPaths(ctx.cwd);
-		if (!projectOverridesActive && projectOverrides.size > 0) {
-			ctx.ui.notify("项目 Toolbox 覆盖因项目未受信任而未加载；全局状态仍然生效", "warning");
-		}
 		for (const warning of discoveryWarnings) ctx.ui.notify(warning, "warning");
 	});
 
 	pi.on("resources_discover", async (event, ctx) => {
 		if (event.cwd !== runtimeCwd) await refreshState(event.cwd);
-		recomputeEffective(isProjectOverrideAllowed(ctx));
+		recomputeEffective();
 		return {
 			skillPaths: [
 				...new Set(
@@ -877,7 +823,7 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 			}
 
 			await refreshState(ctx.cwd);
-			recomputeEffective(isProjectOverrideAllowed(ctx));
+			recomputeEffective();
 			const tokens = input.split(/\s+/);
 			let scope: ConfigScope = "project";
 			if (tokens[0] === "project" || tokens[0] === "global") scope = tokens.shift() as ConfigScope;
@@ -900,7 +846,7 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(
 					scope === "global"
 						? formatGlobalStatus(capabilities, globalEnabledIds)
-						: formatProjectStatus(capabilities, globalEnabledIds, projectOverrides, projectOverridesActive),
+						: formatProjectStatus(capabilities, globalEnabledIds, projectOverrides),
 					"info",
 				);
 				return;
