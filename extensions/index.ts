@@ -284,8 +284,14 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		const discovery = await discoverCapabilities();
 		const loaded = await readProjectConfig(cwd);
 		capabilities = discovery.capabilities;
-		enabledIds = new Set(loaded.config.enabled);
-		discoveryWarnings = [...discovery.warnings, ...loaded.warnings];
+		const knownIds = new Set(capabilities.map((capability) => capability.id));
+		const unknownIds = loaded.config.enabled.filter((id) => !knownIds.has(id));
+		enabledIds = new Set(loaded.config.enabled.filter((id) => knownIds.has(id)));
+		discoveryWarnings = [
+			...discovery.warnings,
+			...loaded.warnings,
+			...(unknownIds.length > 0 ? [`${projectConfigPath(cwd)}: 未发现能力 ${unknownIds.join(", ")}`] : []),
+		];
 		return loaded;
 	}
 
