@@ -1,7 +1,7 @@
 {
   "name": "pi-toolbox",
-  "version": "0.1.1",
-  "description": "按项目启用集中管理的 Pi Skills 和命令行能力",
+  "version": "0.2.0",
+  "description": "按全局默认值和项目覆盖启用集中管理的 Pi Skills 与命令行能力",
   "type": "module",
   "keywords": [
     "pi-package"

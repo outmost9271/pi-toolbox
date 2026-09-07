@@ -1,10 +1,11 @@
 import { appendFile, chmod, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	CONFIG_DIR_NAME,
 	createBashTool,
 	DynamicBorder,
+	getAgentDir,
 	getSettingsListTheme,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -22,6 +23,10 @@ const CONFIG_FILE_NAME = "toolbox.json";
 const MANIFEST_FILE_NAME = "manifest.json";
 const CAPABILITY_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
+type ProjectOverride = "enabled" | "disabled";
+type ConfigScope = "project" | "global";
+type ConfigAction = "list" | "status" | "enable" | "disable" | "inherit";
+
 interface CapabilityManifest {
 	id: string;
 	name: string;
@@ -36,15 +41,27 @@ interface Capability extends CapabilityManifest {
 	resolvedBinPaths: string[];
 }
 
-interface ToolboxConfig {
+interface GlobalToolboxConfig {
 	version: 1;
 	enabled: string[];
 }
 
-interface LoadedConfig {
+interface ProjectToolboxConfig {
+	version: 2;
+	overrides: Record<string, ProjectOverride>;
+}
+
+interface LoadedGlobalConfig {
 	exists: boolean;
-	config: ToolboxConfig;
+	config: GlobalToolboxConfig;
 	warnings: string[];
+}
+
+interface LoadedProjectConfig {
+	exists: boolean;
+	config: ProjectToolboxConfig;
+	warnings: string[];
+	migratedFromV1: boolean;
 }
 
 interface ToolboxProcessState {
@@ -53,6 +70,10 @@ interface ToolboxProcessState {
 
 const processState = globalThis as typeof globalThis & ToolboxProcessState;
 const explicitlyApprovedCwds = (processState.__piToolboxApprovedCwds ??= new Set<string>());
+
+function globalConfigPath(): string {
+	return join(getAgentDir(), CONFIG_FILE_NAME);
+}
 
 function projectConfigPath(cwd: string): string {
 	return join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
@@ -64,6 +85,10 @@ function isNodeError(error: unknown, code: string): boolean {
 
 function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function resolveOwnedPath(root: string, value: string): string | undefined {
@@ -111,7 +136,7 @@ async function discoverCapabilities(): Promise<{ capabilities: Capability[]; war
 			continue;
 		}
 
-		if (!raw || typeof raw !== "object") {
+		if (!isRecord(raw)) {
 			warnings.push(`${manifestPath}: 清单必须是 JSON 对象`);
 			continue;
 		}
@@ -168,8 +193,8 @@ async function discoverCapabilities(): Promise<{ capabilities: Capability[]; war
 	return { capabilities, warnings };
 }
 
-async function readProjectConfig(cwd: string): Promise<LoadedConfig> {
-	const path = projectConfigPath(cwd);
+async function readGlobalConfig(): Promise<LoadedGlobalConfig> {
+	const path = globalConfigPath();
 	let raw: unknown;
 
 	try {
@@ -185,7 +210,7 @@ async function readProjectConfig(cwd: string): Promise<LoadedConfig> {
 		};
 	}
 
-	if (!raw || typeof raw !== "object") {
+	if (!isRecord(raw)) {
 		return { exists: true, config: { version: 1, enabled: [] }, warnings: [`${path}: 配置必须是 JSON 对象`] };
 	}
 
@@ -201,6 +226,72 @@ async function readProjectConfig(cwd: string): Promise<LoadedConfig> {
 	const enabled = [...new Set(value.enabled.filter((id) => CAPABILITY_ID_PATTERN.test(id)))];
 	const warnings = enabled.length === value.enabled.length ? [] : [`${path}: 已忽略无效或重复的能力标识`];
 	return { exists: true, config: { version: 1, enabled }, warnings };
+}
+
+async function readProjectConfig(cwd: string): Promise<LoadedProjectConfig> {
+	const path = projectConfigPath(cwd);
+	let raw: unknown;
+
+	try {
+		raw = JSON.parse(await readFile(path, "utf8"));
+	} catch (error) {
+		if (isNodeError(error, "ENOENT")) {
+			return { exists: false, config: { version: 2, overrides: {} }, warnings: [], migratedFromV1: false };
+		}
+		return {
+			exists: true,
+			config: { version: 2, overrides: {} },
+			warnings: [`${path}: ${error instanceof Error ? error.message : String(error)}`],
+			migratedFromV1: false,
+		};
+	}
+
+	if (!isRecord(raw)) {
+		return {
+			exists: true,
+			config: { version: 2, overrides: {} },
+			warnings: [`${path}: 配置必须是 JSON 对象`],
+			migratedFromV1: false,
+		};
+	}
+
+	const value = raw as { version?: unknown; enabled?: unknown; overrides?: unknown };
+	if (value.version === 1 && isStringArray(value.enabled)) {
+		const enabled = [...new Set(value.enabled.filter((id) => CAPABILITY_ID_PATTERN.test(id)))];
+		const overrides = Object.fromEntries(enabled.map((id) => [id, "enabled" as const]));
+		const warnings = enabled.length === value.enabled.length ? [] : [`${path}: 已忽略无效或重复的能力标识`];
+		return {
+			exists: true,
+			config: { version: 2, overrides },
+			warnings,
+			migratedFromV1: true,
+		};
+	}
+
+	if (value.version !== 2 || !isRecord(value.overrides)) {
+		return {
+			exists: true,
+			config: { version: 2, overrides: {} },
+			warnings: [`${path}: 仅支持 version 2 overrides，或旧版 version 1 enabled`],
+			migratedFromV1: false,
+		};
+	}
+
+	const overrides: Record<string, ProjectOverride> = {};
+	let ignored = false;
+	for (const [id, state] of Object.entries(value.overrides)) {
+		if (CAPABILITY_ID_PATTERN.test(id) && (state === "enabled" || state === "disabled")) {
+			overrides[id] = state;
+		} else {
+			ignored = true;
+		}
+	}
+	return {
+		exists: true,
+		config: { version: 2, overrides },
+		warnings: ignored ? [`${path}: 已忽略无效的项目覆盖项`] : [],
+		migratedFromV1: false,
+	};
 }
 
 function escapeGitIgnorePath(path: string): string {
@@ -257,9 +348,7 @@ async function ensureLocalGitExclude(
 	return undefined;
 }
 
-async function writeProjectConfig(cwd: string, enabled: Iterable<string>): Promise<void> {
-	const path = projectConfigPath(cwd);
-	const config: ToolboxConfig = { version: 1, enabled: [...new Set(enabled)].sort() };
+async function writeJsonConfig(path: string, config: GlobalToolboxConfig | ProjectToolboxConfig): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });
 	const temporaryPath = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
 	await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -267,60 +356,199 @@ async function writeProjectConfig(cwd: string, enabled: Iterable<string>): Promi
 	await chmod(path, 0o600);
 }
 
+async function writeGlobalConfig(enabled: Iterable<string>): Promise<void> {
+	await writeJsonConfig(globalConfigPath(), { version: 1, enabled: [...new Set(enabled)].sort() });
+}
+
+async function writeProjectConfig(cwd: string, overrides: ReadonlyMap<string, ProjectOverride>): Promise<void> {
+	const sortedOverrides = Object.fromEntries([...overrides.entries()].sort(([left], [right]) => left.localeCompare(right)));
+	await writeJsonConfig(projectConfigPath(cwd), { version: 2, overrides: sortedOverrides });
+}
+
+function computeEffectiveEnabled(
+	capabilities: Capability[],
+	globalEnabled: ReadonlySet<string>,
+	projectOverrides: ReadonlyMap<string, ProjectOverride>,
+	applyProjectOverrides: boolean,
+): Set<string> {
+	const knownIds = new Set(capabilities.map((capability) => capability.id));
+	const effective = new Set([...globalEnabled].filter((id) => knownIds.has(id)));
+	if (!applyProjectOverrides) return effective;
+	for (const [id, state] of projectOverrides) {
+		if (!knownIds.has(id)) continue;
+		if (state === "enabled") effective.add(id);
+		else effective.delete(id);
+	}
+	return effective;
+}
+
 function selectedCapabilities(capabilities: Capability[], enabled: ReadonlySet<string>): Capability[] {
 	return capabilities.filter((capability) => enabled.has(capability.id));
 }
 
-function formatStatus(capabilities: Capability[], enabled: ReadonlySet<string>, active: boolean): string {
+function setsEqual(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+	return left.size === right.size && [...left].every((value) => right.has(value));
+}
+
+function mapsEqual(
+	left: ReadonlyMap<string, ProjectOverride>,
+	right: ReadonlyMap<string, ProjectOverride>,
+): boolean {
+	return left.size === right.size && [...left].every(([key, value]) => right.get(key) === value);
+}
+
+function formatGlobalStatus(capabilities: Capability[], globalEnabled: ReadonlySet<string>): string {
 	if (capabilities.length === 0) return `未在 ${TOOLBOX_ROOT} 中发现能力`;
-	const lines = capabilities.map(
-		(capability) => `${enabled.has(capability.id) ? "●" : "○"} ${capability.id} — ${capability.description}`,
-	);
-	if (enabled.size > 0 && !active) lines.unshift("当前项目尚未受信任，已配置能力本次未加载。", "");
+	return capabilities
+		.map(
+			(capability) =>
+				`${globalEnabled.has(capability.id) ? "●" : "○"} ${capability.id} — 全局${globalEnabled.has(capability.id) ? "开启" : "关闭"}`,
+		)
+		.join("\n");
+}
+
+function formatProjectStatus(
+	capabilities: Capability[],
+	globalEnabled: ReadonlySet<string>,
+	projectOverrides: ReadonlyMap<string, ProjectOverride>,
+	applyProjectOverrides: boolean,
+): string {
+	if (capabilities.length === 0) return `未在 ${TOOLBOX_ROOT} 中发现能力`;
+	const effective = computeEffectiveEnabled(capabilities, globalEnabled, projectOverrides, applyProjectOverrides);
+	const lines = capabilities.map((capability) => {
+		const globalOn = globalEnabled.has(capability.id);
+		const override = projectOverrides.get(capability.id);
+		let source: string;
+		if (!applyProjectOverrides && override) {
+			source = `项目覆盖未加载；当前按全局${globalOn ? "开启" : "关闭"}`;
+		} else if (override === "enabled") {
+			source = globalOn ? "项目明确开启（与全局一致）" : "项目明确开启（覆盖全局关闭）";
+		} else if (override === "disabled") {
+			source = globalOn ? "项目明确关闭（覆盖全局开启）" : "项目明确关闭（与全局一致）";
+		} else {
+			source = `继承全局${globalOn ? "开启" : "关闭"}`;
+		}
+		return `${effective.has(capability.id) ? "●" : "○"} ${capability.id} — ${source}`;
+	});
+	if (!applyProjectOverrides && projectOverrides.size > 0) {
+		lines.unshift("当前项目尚未受信任，项目覆盖本次未加载。", "");
+	}
 	return lines.join("\n");
 }
 
-function getToolboxArgumentCompletions(
-	argumentPrefix: string,
-	capabilities: Capability[],
-	enabledIds: ReadonlySet<string>,
-): AutocompleteItem[] | null {
-	const actions = ["list", "status", "enable", "disable"];
-	if (!argumentPrefix.includes(" ")) {
-		const query = argumentPrefix.trim();
-		const matches = actions.filter((action) => action.startsWith(query));
-		return matches.length > 0
-			? matches.map((action) => ({
-					value: action === "enable" || action === "disable" ? `${action} ` : action,
-					label: action,
-				}))
-			: null;
-	}
+function actionsForScope(scope: ConfigScope): ConfigAction[] {
+	return scope === "global"
+		? ["list", "status", "enable", "disable"]
+		: ["list", "status", "enable", "disable", "inherit"];
+}
 
-	const match = argumentPrefix.match(/^(enable|disable)\s+(.*)$/);
-	if (!match) return null;
-	const action = match[1];
-	const query = match[2].trim().toLowerCase();
-	const candidates = capabilities.filter((capability) =>
-		action === "enable" ? !enabledIds.has(capability.id) : enabledIds.has(capability.id),
-	);
-	const filtered = candidates.filter((capability) =>
-		`${capability.id} ${capability.name} ${capability.description}`.toLowerCase().includes(query),
+function actionNeedsCapability(action: ConfigAction): boolean {
+	return action === "enable" || action === "disable" || action === "inherit";
+}
+
+function completionCandidates(
+	scope: ConfigScope,
+	action: ConfigAction,
+	capabilities: Capability[],
+	globalEnabled: ReadonlySet<string>,
+	projectOverrides: ReadonlyMap<string, ProjectOverride>,
+): Capability[] {
+	if (scope === "global") {
+		if (action === "enable") return capabilities.filter((capability) => !globalEnabled.has(capability.id));
+		if (action === "disable") return capabilities.filter((capability) => globalEnabled.has(capability.id));
+		return [];
+	}
+	if (action === "enable") return capabilities.filter((capability) => projectOverrides.get(capability.id) !== "enabled");
+	if (action === "disable") return capabilities.filter((capability) => projectOverrides.get(capability.id) !== "disabled");
+	if (action === "inherit") return capabilities.filter((capability) => projectOverrides.has(capability.id));
+	return [];
+}
+
+function completeActions(prefix: string, scope: ConfigScope, valuePrefix: string): AutocompleteItem[] | null {
+	const matches = actionsForScope(scope).filter((action) => action.startsWith(prefix));
+	return matches.length > 0
+		? matches.map((action) => ({
+				value: `${valuePrefix}${action}${actionNeedsCapability(action) ? " " : ""}`,
+				label: action,
+			}))
+		: null;
+}
+
+function completeCapabilities(
+	scope: ConfigScope,
+	action: ConfigAction,
+	query: string,
+	capabilities: Capability[],
+	globalEnabled: ReadonlySet<string>,
+	projectOverrides: ReadonlyMap<string, ProjectOverride>,
+	valuePrefix: string,
+): AutocompleteItem[] | null {
+	const normalizedQuery = query.trim().toLowerCase();
+	const filtered = completionCandidates(scope, action, capabilities, globalEnabled, projectOverrides).filter(
+		(capability) =>
+			`${capability.id} ${capability.name} ${capability.description}`.toLowerCase().includes(normalizedQuery),
 	);
 	return filtered.length > 0
 		? filtered.map((capability) => ({
-				value: `${action} ${capability.id}`,
+				value: `${valuePrefix}${action} ${capability.id}`,
 				label: capability.id,
 				description: capability.description,
 			}))
 		: null;
 }
 
-function getToolboxArgumentPrefix(
-	lines: string[],
-	cursorLine: number,
-	cursorCol: number,
-): string | undefined {
+function getToolboxArgumentCompletions(
+	argumentPrefix: string,
+	capabilities: Capability[],
+	globalEnabled: ReadonlySet<string>,
+	projectOverrides: ReadonlyMap<string, ProjectOverride>,
+): AutocompleteItem[] | null {
+	if (!argumentPrefix.includes(" ")) {
+		const query = argumentPrefix.trim();
+		const topLevel = ["project", "global", ...actionsForScope("project")].filter((value) => value.startsWith(query));
+		return topLevel.length > 0
+			? topLevel.map((value) => ({
+					value: `${value}${value === "project" || value === "global" || actionNeedsCapability(value as ConfigAction) ? " " : ""}`,
+					label: value,
+				}))
+			: null;
+	}
+
+	const scopedMatch = argumentPrefix.match(/^(project|global)\s+(.*)$/);
+	if (scopedMatch) {
+		const scope = scopedMatch[1] as ConfigScope;
+		const remainder = scopedMatch[2];
+		const valuePrefix = `${scope} `;
+		if (!remainder.includes(" ")) return completeActions(remainder.trim(), scope, valuePrefix);
+		const actionMatch = remainder.match(/^(enable|disable|inherit)\s+(.*)$/);
+		if (!actionMatch) return null;
+		const action = actionMatch[1] as ConfigAction;
+		if (scope === "global" && action === "inherit") return null;
+		return completeCapabilities(
+			scope,
+			action,
+			actionMatch[2],
+			capabilities,
+			globalEnabled,
+			projectOverrides,
+			valuePrefix,
+		);
+	}
+
+	const legacyMatch = argumentPrefix.match(/^(enable|disable|inherit)\s+(.*)$/);
+	if (!legacyMatch) return null;
+	return completeCapabilities(
+		"project",
+		legacyMatch[1] as ConfigAction,
+		legacyMatch[2],
+		capabilities,
+		globalEnabled,
+		projectOverrides,
+		"",
+	);
+}
+
+function getToolboxArgumentPrefix(lines: string[], cursorLine: number, cursorCol: number): string | undefined {
 	const line = lines[cursorLine] ?? "";
 	const beforeCursor = line.slice(0, cursorCol);
 	const match = beforeCursor.match(/^\/toolbox\s(.*)$/);
@@ -338,7 +566,6 @@ function createToolboxAutocompleteProvider(
 			if (argumentPrefix === undefined) {
 				return current.getSuggestions(lines, cursorLine, cursorCol, options);
 			}
-
 			const items = getCompletions(argumentPrefix);
 			return items && items.length > 0 ? { items, prefix: argumentPrefix } : null;
 		},
@@ -355,29 +582,62 @@ function createToolboxAutocompleteProvider(
 export default function toolboxExtension(pi: ExtensionAPI): void {
 	let runtimeCwd = process.cwd();
 	let capabilities: Capability[] = [];
-	let enabledIds = new Set<string>();
-	let runtimeActive = false;
+	let globalEnabledIds = new Set<string>();
+	let projectOverrides = new Map<string, ProjectOverride>();
+	let effectiveEnabledIds = new Set<string>();
+	let projectOverridesActive = false;
 	let discoveryWarnings: string[] = [];
 
-	async function refreshState(cwd: string): Promise<LoadedConfig> {
+	function recomputeEffective(applyProjectOverrides: boolean): void {
+		projectOverridesActive = applyProjectOverrides;
+		effectiveEnabledIds = computeEffectiveEnabled(
+			capabilities,
+			globalEnabledIds,
+			projectOverrides,
+			applyProjectOverrides,
+		);
+	}
+
+	async function refreshState(cwd: string): Promise<LoadedProjectConfig> {
 		runtimeCwd = cwd;
-		const discovery = await discoverCapabilities();
-		const loaded = await readProjectConfig(cwd);
+		const [discovery, loadedGlobal, loadedProject] = await Promise.all([
+			discoverCapabilities(),
+			readGlobalConfig(),
+			readProjectConfig(cwd),
+		]);
 		capabilities = discovery.capabilities;
 		const knownIds = new Set(capabilities.map((capability) => capability.id));
-		const unknownIds = loaded.config.enabled.filter((id) => !knownIds.has(id));
-		enabledIds = new Set(loaded.config.enabled.filter((id) => knownIds.has(id)));
+		const unknownGlobalIds = loadedGlobal.config.enabled.filter((id) => !knownIds.has(id));
+		const unknownProjectIds = Object.keys(loadedProject.config.overrides).filter((id) => !knownIds.has(id));
+		globalEnabledIds = new Set(loadedGlobal.config.enabled.filter((id) => knownIds.has(id)));
+		projectOverrides = new Map(
+			Object.entries(loadedProject.config.overrides).filter(([id]) => knownIds.has(id)),
+		);
 		discoveryWarnings = [
 			...discovery.warnings,
-			...loaded.warnings,
-			...(unknownIds.length > 0 ? [`${projectConfigPath(cwd)}: 未发现能力 ${unknownIds.join(", ")}`] : []),
+			...loadedGlobal.warnings,
+			...loadedProject.warnings,
+			...(unknownGlobalIds.length > 0
+				? [`${globalConfigPath()}: 未发现能力 ${unknownGlobalIds.join(", ")}`]
+				: []),
+			...(unknownProjectIds.length > 0
+				? [`${projectConfigPath(cwd)}: 未发现能力 ${unknownProjectIds.join(", ")}`]
+				: []),
 		];
-		return loaded;
+		return loadedProject;
+	}
+
+	function isProjectOverrideAllowed(ctx: { cwd: string; isProjectTrusted(): boolean }): boolean {
+		return ctx.isProjectTrusted() || explicitlyApprovedCwds.has(resolve(ctx.cwd));
 	}
 
 	function enableBashPaths(cwd: string): void {
 		const binPaths = [
-			...new Set(selectedCapabilities(capabilities, enabledIds).flatMap((capability) => capability.resolvedBinPaths)),
+			...new Set(
+				selectedCapabilities(capabilities, effectiveEnabledIds).flatMap(
+					(capability) => capability.resolvedBinPaths,
+				),
+			),
 		];
 		if (binPaths.length === 0) return;
 
@@ -394,62 +654,71 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		pi.registerTool(bashTool);
 	}
 
-	async function approveExplicitChange(ctx: ExtensionCommandContext): Promise<boolean> {
-		if (ctx.isProjectTrusted() || explicitlyApprovedCwds.has(resolve(ctx.cwd))) return true;
+	async function approveExplicitProjectChange(ctx: ExtensionCommandContext): Promise<boolean> {
+		if (isProjectOverrideAllowed(ctx)) return true;
 		if (!ctx.hasUI) return false;
 		const approved = await ctx.ui.confirm(
 			"启用当前项目的 Toolbox 配置？",
-			`${ctx.cwd}\n\n启用后，Agent 可以访问所选能力及其共享认证。`,
+			`${ctx.cwd}\n\n项目覆盖可以访问或关闭全局共享能力及其认证。`,
 		);
 		if (approved) explicitlyApprovedCwds.add(resolve(ctx.cwd));
 		return approved;
 	}
 
-	async function persistAndReload(ctx: ExtensionCommandContext, nextEnabled: Set<string>): Promise<void> {
-		if (!(await approveExplicitChange(ctx))) {
-			ctx.ui.notify("未修改 Toolbox 配置", "warning");
+	async function persistProjectAndReload(
+		ctx: ExtensionCommandContext,
+		nextOverrides: Map<string, ProjectOverride>,
+	): Promise<void> {
+		if (!(await approveExplicitProjectChange(ctx))) {
+			ctx.ui.notify("未修改项目 Toolbox 配置", "warning");
 			return;
 		}
-
-		const configPath = projectConfigPath(ctx.cwd);
-		const excludeWarning = await ensureLocalGitExclude(pi, ctx.cwd, configPath);
-		await writeProjectConfig(ctx.cwd, nextEnabled);
+		const path = projectConfigPath(ctx.cwd);
+		const excludeWarning = await ensureLocalGitExclude(pi, ctx.cwd, path);
+		await writeProjectConfig(ctx.cwd, nextOverrides);
 		if (excludeWarning) ctx.ui.notify(excludeWarning, "warning");
 		await ctx.reload();
 	}
 
-	async function showSelector(ctx: ExtensionCommandContext): Promise<void> {
+	async function persistGlobalAndReload(ctx: ExtensionCommandContext, nextEnabled: Set<string>): Promise<void> {
+		await writeGlobalConfig(nextEnabled);
+		await ctx.reload();
+	}
+
+	async function showGlobalSelector(ctx: ExtensionCommandContext): Promise<void> {
 		await refreshState(ctx.cwd);
 		if (capabilities.length === 0) {
 			ctx.ui.notify(`未在 ${TOOLBOX_ROOT} 中发现能力`, "warning");
 			return;
 		}
 		if (ctx.mode !== "tui") {
-			ctx.ui.notify("/toolbox 不带参数时需要 TUI 模式", "error");
+			ctx.ui.notify("Toolbox 配置界面需要 TUI 模式", "error");
 			return;
 		}
 
-		const initial = new Set(enabledIds);
-		const selected = new Set(enabledIds);
+		const initial = new Set(globalEnabledIds);
+		const selected = new Set(globalEnabledIds);
 		await ctx.ui.custom((tui, theme, _keybindings, done) => {
 			const container = new Container();
 			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-			container.addChild(new Text(theme.fg("accent", theme.bold("项目能力配置")), 1, 0));
-
+			container.addChild(new Text(theme.fg("accent", theme.bold("全局能力默认值")), 1, 0));
 			const items: SettingItem[] = capabilities.map((capability) => ({
 				id: capability.id,
 				label: capability.name,
-				description: capability.description,
-				currentValue: selected.has(capability.id) ? "启用" : "关闭",
-				values: ["启用", "关闭"],
+				description: `${capability.description}；所有项目默认${selected.has(capability.id) ? "开启" : "关闭"}`,
+				currentValue: selected.has(capability.id) ? "开启" : "关闭",
+				values: ["开启", "关闭"],
 			}));
 			const settings = new SettingsList(
 				items,
 				Math.min(items.length + 2, 15),
 				getSettingsListTheme(),
 				(id, value) => {
-					if (value === "启用") selected.add(id);
+					if (value === "开启") selected.add(id);
 					else selected.delete(id);
+					const item = items.find((item) => item.id === id);
+					const capability = capabilities.find((capability) => capability.id === id);
+					if (item && capability) item.description = `${capability.description}；所有项目默认${selected.has(id) ? "开启" : "关闭"}`;
 				},
 				() => done(undefined),
 				{ enableSearch: true },
@@ -457,7 +726,6 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 			container.addChild(settings);
 			container.addChild(new Text(theme.fg("dim", "输入搜索 · Enter 切换 · Esc 保存并关闭"), 1, 0));
 			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-
 			return {
 				render: (width: number) => container.render(width),
 				invalidate: () => container.invalidate(),
@@ -467,20 +735,91 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 				},
 			};
 		});
+		if (!setsEqual(initial, selected)) await persistGlobalAndReload(ctx, selected);
+	}
 
-		const changed =
-			initial.size !== selected.size || [...initial].some((capabilityId) => !selected.has(capabilityId));
-		if (changed) await persistAndReload(ctx, selected);
+	async function showProjectSelector(ctx: ExtensionCommandContext): Promise<void> {
+		await refreshState(ctx.cwd);
+		if (capabilities.length === 0) {
+			ctx.ui.notify(`未在 ${TOOLBOX_ROOT} 中发现能力`, "warning");
+			return;
+		}
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("Toolbox 配置界面需要 TUI 模式", "error");
+			return;
+		}
+
+		const initial = new Map(projectOverrides);
+		const selected = new Map(projectOverrides);
+		await ctx.ui.custom((tui, theme, _keybindings, done) => {
+			const container = new Container();
+			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+			container.addChild(new Text(theme.fg("accent", theme.bold("当前项目能力覆盖")), 1, 0));
+			const items: SettingItem[] = capabilities.map((capability) => {
+				const globalOn = globalEnabledIds.has(capability.id);
+				const inheritValue = `继承（全局${globalOn ? "开启" : "关闭"}）`;
+				const override = selected.get(capability.id);
+				return {
+					id: capability.id,
+					label: capability.name,
+					description: `${capability.description}；当前最终${override === "enabled" || (!override && globalOn) ? "开启" : "关闭"}`,
+					currentValue: override === "enabled" ? "开启" : override === "disabled" ? "关闭" : inheritValue,
+					values: [inheritValue, "开启", "关闭"],
+				};
+			});
+			const settings = new SettingsList(
+				items,
+				Math.min(items.length + 2, 15),
+				getSettingsListTheme(),
+				(id, value) => {
+					if (value === "开启") selected.set(id, "enabled");
+					else if (value === "关闭") selected.set(id, "disabled");
+					else selected.delete(id);
+					const item = items.find((item) => item.id === id);
+					const capability = capabilities.find((capability) => capability.id === id);
+					const on = selected.get(id) === "enabled" || (!selected.has(id) && globalEnabledIds.has(id));
+					if (item && capability) item.description = `${capability.description}；保存后最终${on ? "开启" : "关闭"}`;
+				},
+				() => done(undefined),
+				{ enableSearch: true },
+			);
+			container.addChild(settings);
+			container.addChild(new Text(theme.fg("dim", "继承 → 开启 → 关闭 · Esc 保存并关闭"), 1, 0));
+			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+			return {
+				render: (width: number) => container.render(width),
+				invalidate: () => container.invalidate(),
+				handleInput: (data: string) => {
+					settings.handleInput?.(data);
+					tui.requestRender();
+				},
+			};
+		});
+		if (!mapsEqual(initial, selected)) await persistProjectAndReload(ctx, selected);
+	}
+
+	async function showScopeSelector(ctx: ExtensionCommandContext): Promise<void> {
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("/toolbox 不带参数时需要 TUI 模式", "error");
+			return;
+		}
+		const projectChoice = "当前项目（覆盖全局）";
+		const globalChoice = "全局（所有项目默认值）";
+		const selected = await ctx.ui.select("选择 Toolbox 配置范围", [projectChoice, globalChoice]);
+		if (selected === projectChoice) await showProjectSelector(ctx);
+		else if (selected === globalChoice) await showGlobalSelector(ctx);
 	}
 
 	pi.on("project_trust", async (event, ctx) => {
 		const loaded = await readProjectConfig(event.cwd);
-		if (!loaded.exists || loaded.config.enabled.length === 0 || !ctx.hasUI) {
-			return { trusted: "undecided" };
-		}
+		const overrides = Object.entries(loaded.config.overrides);
+		if (!loaded.exists || overrides.length === 0 || !ctx.hasUI) return { trusted: "undecided" };
+		const summary = overrides
+			.map(([id, state]) => `${id}=${state === "enabled" ? "开启" : "关闭"}`)
+			.join(", ");
 		const trusted = await ctx.ui.confirm(
 			"信任项目的 Toolbox 配置？",
-			`${event.cwd}\n\n项目请求启用：${loaded.config.enabled.join(", ")}。`,
+			`${event.cwd}\n\n项目请求覆盖：${summary}。`,
 		);
 		return { trusted: trusted ? "yes" : "no", remember: true };
 	});
@@ -490,79 +829,114 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		if (ctx.mode === "tui") {
 			ctx.ui.addAutocompleteProvider((current) =>
 				createToolboxAutocompleteProvider(current, (argumentPrefix) =>
-					getToolboxArgumentCompletions(argumentPrefix, capabilities, enabledIds),
+					getToolboxArgumentCompletions(
+						argumentPrefix,
+						capabilities,
+						globalEnabledIds,
+						projectOverrides,
+					),
 				),
 			);
 		}
-		runtimeActive = ctx.isProjectTrusted() || explicitlyApprovedCwds.has(resolve(ctx.cwd));
-		if (runtimeActive) enableBashPaths(ctx.cwd);
-		else if (enabledIds.size > 0) ctx.ui.notify("Toolbox 配置因项目未受信任而未加载", "warning");
+		recomputeEffective(isProjectOverrideAllowed(ctx));
+		enableBashPaths(ctx.cwd);
+		if (!projectOverridesActive && projectOverrides.size > 0) {
+			ctx.ui.notify("项目 Toolbox 覆盖因项目未受信任而未加载；全局状态仍然生效", "warning");
+		}
 		for (const warning of discoveryWarnings) ctx.ui.notify(warning, "warning");
 	});
 
 	pi.on("resources_discover", async (event, ctx) => {
 		if (event.cwd !== runtimeCwd) await refreshState(event.cwd);
-		const active = ctx.isProjectTrusted() || explicitlyApprovedCwds.has(resolve(event.cwd));
-		if (!active) return { skillPaths: [] };
+		recomputeEffective(isProjectOverrideAllowed(ctx));
 		return {
 			skillPaths: [
 				...new Set(
-					selectedCapabilities(capabilities, enabledIds).flatMap((capability) => capability.resolvedSkillPaths),
+					selectedCapabilities(capabilities, effectiveEnabledIds).flatMap(
+						(capability) => capability.resolvedSkillPaths,
+					),
 				),
 			],
 		};
 	});
 
 	pi.registerCommand("toolbox", {
-		description: "启用或关闭当前项目的共享能力",
+		description: "配置全局能力默认值和当前项目覆盖",
 		getArgumentCompletions: (argumentPrefix) =>
-			getToolboxArgumentCompletions(argumentPrefix, capabilities, enabledIds),
+			getToolboxArgumentCompletions(
+				argumentPrefix,
+				capabilities,
+				globalEnabledIds,
+				projectOverrides,
+			),
 		handler: async (args, ctx) => {
 			const input = args.trim();
 			if (!input) {
-				await showSelector(ctx);
+				await showScopeSelector(ctx);
 				return;
 			}
 
 			await refreshState(ctx.cwd);
-			const [action, capabilityId, ...extra] = input.split(/\s+/);
-			if (extra.length > 0 || !["list", "status", "enable", "disable"].includes(action)) {
-				ctx.ui.notify("用法：/toolbox [list|status|enable <能力>|disable <能力>]", "error");
+			recomputeEffective(isProjectOverrideAllowed(ctx));
+			const tokens = input.split(/\s+/);
+			let scope: ConfigScope = "project";
+			if (tokens[0] === "project" || tokens[0] === "global") scope = tokens.shift() as ConfigScope;
+			if (tokens.length === 0) {
+				if (scope === "global") await showGlobalSelector(ctx);
+				else await showProjectSelector(ctx);
+				return;
+			}
+
+			const action = tokens.shift() as ConfigAction;
+			if (!actionsForScope(scope).includes(action) || tokens.length > (actionNeedsCapability(action) ? 1 : 0)) {
+				ctx.ui.notify(
+					"用法：/toolbox [project|global] [list|status|enable <能力>|disable <能力>|inherit <能力>]",
+					"error",
+				);
 				return;
 			}
 
 			if (action === "list" || action === "status") {
-				const active = ctx.isProjectTrusted() || explicitlyApprovedCwds.has(resolve(ctx.cwd));
-				ctx.ui.notify(formatStatus(capabilities, enabledIds, active), "info");
+				ctx.ui.notify(
+					scope === "global"
+						? formatGlobalStatus(capabilities, globalEnabledIds)
+						: formatProjectStatus(capabilities, globalEnabledIds, projectOverrides, projectOverridesActive),
+					"info",
+				);
 				return;
 			}
 
+			const capabilityId = tokens[0];
 			if (!capabilityId) {
-				ctx.ui.notify(`/toolbox ${action} 需要能力名称`, "error");
+				ctx.ui.notify(`/toolbox ${scope} ${action} 需要能力名称`, "error");
 				return;
 			}
-			const capability = capabilities.find((item) => item.id === capabilityId);
-			if (!capability) {
+			if (!capabilities.some((capability) => capability.id === capabilityId)) {
 				ctx.ui.notify(`未知能力：${capabilityId}`, "error");
 				return;
 			}
 
-			const nextEnabled = new Set(enabledIds);
-			if (action === "enable") {
-				if (nextEnabled.has(capabilityId)) {
-					ctx.ui.notify(`${capabilityId} 已启用`, "info");
+			if (scope === "global") {
+				const nextEnabled = new Set(globalEnabledIds);
+				if (action === "enable") nextEnabled.add(capabilityId);
+				else nextEnabled.delete(capabilityId);
+				if (setsEqual(globalEnabledIds, nextEnabled)) {
+					ctx.ui.notify(`${capabilityId} 的全局状态未变化`, "info");
 					return;
 				}
-				nextEnabled.add(capabilityId);
-			} else {
-				if (!nextEnabled.has(capabilityId)) {
-					ctx.ui.notify(`${capabilityId} 已关闭`, "info");
-					return;
-				}
-				nextEnabled.delete(capabilityId);
+				await persistGlobalAndReload(ctx, nextEnabled);
+				return;
 			}
 
-			await persistAndReload(ctx, nextEnabled);
+			const nextOverrides = new Map(projectOverrides);
+			if (action === "enable") nextOverrides.set(capabilityId, "enabled");
+			else if (action === "disable") nextOverrides.set(capabilityId, "disabled");
+			else nextOverrides.delete(capabilityId);
+			if (mapsEqual(projectOverrides, nextOverrides)) {
+				ctx.ui.notify(`${capabilityId} 的项目覆盖未变化`, "info");
+				return;
+			}
+			await persistProjectAndReload(ctx, nextOverrides);
 		},
 	});
 }
