@@ -10,6 +10,7 @@ const source = readFileSync(new URL("../extensions/index.ts", import.meta.url), 
 const helpers = source.slice(source.indexOf("function actionsForScope("), source.indexOf("export default function"));
 const { getToolboxArgumentCompletions, createToolboxAutocompleteProvider } = runInNewContext(
   stripTypeScriptTypes(helpers) + ";({ getToolboxArgumentCompletions, createToolboxAutocompleteProvider })",
+  { PLUGIN_COMMAND_NAMES: ["plugin", "plugins"], getPluginCompletions: () => null },
 );
 const capabilities = [
   { id: "exa", name: "Exa", description: "Search" },

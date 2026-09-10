@@ -17,6 +17,18 @@ import {
 	SettingsList,
 	Text,
 } from "@earendil-works/pi-tui";
+import {
+	findPlugin,
+	formatPluginDetail,
+	formatPluginsList,
+	getPluginCompletions,
+	loadPluginInfo,
+	PLUGIN_COMMAND_NAMES,
+	setGlobalPluginState,
+	setProjectPluginState,
+	type PluginAction,
+	type PluginInfo,
+} from "./plugins.ts";
 
 const TOOLBOX_ROOT = process.env.PI_TOOLBOX_ROOT ?? "/agent-pi/tools";
 const CONFIG_FILE_NAME = "toolbox.json";
@@ -487,16 +499,21 @@ function getToolboxArgumentCompletions(
 	capabilities: Capability[],
 	globalEnabled: ReadonlySet<string>,
 	projectOverrides: ReadonlyMap<string, ProjectOverride>,
+	plugins: PluginInfo[] = [],
 ): AutocompleteItem[] | null {
+	const pluginItems = getPluginCompletions(argumentPrefix, plugins);
+	if (pluginItems && pluginItems.length > 0) return pluginItems;
 	// Match command parsing while retaining a trailing separator for chained completion.
 	// Keep the provider's original prefix unchanged so insertion replaces the full input.
 	argumentPrefix = argumentPrefix.replace(/^[ \t]+/, "").replace(/[ \t]+/g, " ");
 	if (!argumentPrefix.includes(" ")) {
 		const query = argumentPrefix.trim();
-		const topLevel = ["project", "global", ...actionsForScope("project")].filter((value) => value.startsWith(query));
+		const topLevel = ["project", "global", ...actionsForScope("project"), ...PLUGIN_COMMAND_NAMES].filter((value) =>
+			value.startsWith(query),
+		);
 		return topLevel.length > 0
 			? topLevel.map((value) => ({
-					value: `${value}${value === "project" || value === "global" || actionNeedsCapability(value as ConfigAction) ? " " : ""}`,
+					value: `${value}${value === "project" || value === "global" || PLUGIN_COMMAND_NAMES.includes(value) || actionNeedsCapability(value as ConfigAction) ? " " : ""}`,
 					label: value,
 				}))
 			: null;
@@ -573,6 +590,8 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 	let globalEnabledIds = new Set<string>();
 	let projectOverrides = new Map<string, ProjectOverride>();
 	let effectiveEnabledIds = new Set<string>();
+	let pluginInfos: PluginInfo[] = [];
+	let pluginWarnings: string[] = [];
 	let discoveryWarnings: string[] = [];
 
 	function recomputeEffective(): void {
@@ -585,11 +604,14 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 
 	async function refreshState(cwd: string): Promise<LoadedProjectConfig> {
 		runtimeCwd = cwd;
-		const [discovery, loadedGlobal, loadedProject] = await Promise.all([
+		const [discovery, loadedGlobal, loadedProject, pluginLoad] = await Promise.all([
 			discoverCapabilities(),
 			readGlobalConfig(),
 			readProjectConfig(cwd),
+			loadPluginInfo({ cwd, agentDir: getAgentDir() }),
 		]);
+		pluginInfos = pluginLoad.plugins;
+		pluginWarnings = pluginLoad.warnings;
 		capabilities = discovery.capabilities;
 		const knownIds = new Set(capabilities.map((capability) => capability.id));
 		const unknownGlobalIds = loadedGlobal.config.enabled.filter((id) => !knownIds.has(id));
@@ -600,6 +622,7 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		);
 		discoveryWarnings = [
 			...discovery.warnings,
+			...pluginLoad.warnings,
 			...loadedGlobal.warnings,
 			...loadedProject.warnings,
 			...(unknownGlobalIds.length > 0
@@ -648,6 +671,62 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 
 	async function persistGlobalAndReload(ctx: ExtensionCommandContext, nextEnabled: Set<string>): Promise<void> {
 		await writeGlobalConfig(nextEnabled);
+		await ctx.reload();
+	}
+
+	async function handlePluginsCommand(tokens: string[], ctx: ExtensionCommandContext): Promise<void> {
+		if (tokens.length > 1 || (tokens[0] && !["status", "list"].includes(tokens[0]))) {
+			ctx.ui.notify("用法：/toolbox plugins [status|list]", "error");
+			return;
+		}
+		ctx.ui.notify([formatPluginsList(pluginInfos), ...pluginWarnings].filter(Boolean).join("\n"), "info");
+	}
+
+	async function handlePluginCommand(tokens: string[], ctx: ExtensionCommandContext): Promise<void> {
+		let scope: ConfigScope = "project";
+		if (tokens[0] === "global") {
+			scope = "global";
+			tokens = tokens.slice(1);
+		}
+		const actions = scope === "global" ? ["status", "enable", "disable"] : ["status", "enable", "disable", "inherit"];
+		const action = tokens[0];
+		if (!action || !actions.includes(action) || tokens.length > 2) {
+			ctx.ui.notify("用法：/toolbox plugin [global] [status|enable|disable|inherit] [<插件>]", "error");
+			return;
+		}
+		if (action === "status" && !tokens[1]) {
+			ctx.ui.notify([formatPluginsList(pluginInfos), ...pluginWarnings].filter(Boolean).join("\n"), "info");
+			return;
+		}
+		const pluginId = tokens[1];
+		if (!pluginId) {
+			ctx.ui.notify(`/toolbox plugin ${scope === "global" ? "global " : ""}${action} 需要插件名称`, "error");
+			return;
+		}
+		const plugin = findPlugin(pluginInfos, pluginId);
+		if (!plugin) {
+			ctx.ui.notify(`未知插件：${pluginId}`, "error");
+			return;
+		}
+		if (action === "status") {
+			ctx.ui.notify(formatPluginDetail(plugin), "info");
+			return;
+		}
+		const result =
+			scope === "global"
+				? await setGlobalPluginState({ agentDir: getAgentDir(), plugin, action: action as "enable" | "disable" })
+				: await setProjectPluginState({ cwd: ctx.cwd, plugin, action: action as PluginAction });
+		if (result.error) {
+			ctx.ui.notify(result.error, "error");
+			return;
+		}
+		for (const warning of result.warnings) ctx.ui.notify(warning, "warning");
+		if (!result.changed) {
+			ctx.ui.notify(`${pluginId} 的状态未变化`, "info");
+			return;
+		}
+		const actionLabel = action === "enable" ? "启用" : action === "disable" ? "禁用" : "恢复继承";
+		ctx.ui.notify(`${pluginId} 已${scope === "global" ? "全局" : "项目"}${actionLabel}；重启 pi 后生效`, "info");
 		await ctx.reload();
 	}
 
@@ -786,6 +865,7 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 						capabilities,
 						globalEnabledIds,
 						projectOverrides,
+						pluginInfos,
 					),
 				),
 			);
@@ -817,6 +897,7 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 				capabilities,
 				globalEnabledIds,
 				projectOverrides,
+				pluginInfos,
 			),
 		handler: async (args, ctx) => {
 			const input = args.trim();
@@ -828,6 +909,14 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 			await refreshState(ctx.cwd);
 			recomputeEffective();
 			const tokens = input.split(/\s+/);
+			if (tokens[0] === "plugins") {
+				await handlePluginsCommand(tokens.slice(1), ctx);
+				return;
+			}
+			if (tokens[0] === "plugin") {
+				await handlePluginCommand(tokens.slice(1), ctx);
+				return;
+			}
 			let scope: ConfigScope = "project";
 			if (tokens[0] === "project" || tokens[0] === "global") scope = tokens.shift() as ConfigScope;
 			if (tokens.length === 0) {
