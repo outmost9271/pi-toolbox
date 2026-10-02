@@ -8,7 +8,9 @@ import {
 	computePluginStates,
 	discoverPluginResources,
 	findPlugin,
-	getPluginCompletions,
+	formatPluginDetail,
+	formatPluginsList,
+	getPluginCompletionCandidates,
 	loadPluginInfo,
 	packageIdentity,
 	parsePackageEntry,
@@ -20,6 +22,7 @@ import {
 	setProjectEnabled,
 	setProjectPluginState,
 } from "../extensions/plugins.ts";
+import { getToolboxCompletions } from "../extensions/commands.ts";
 
 const SETMODEL = "git:github.com/outmost9271/pi-setmodel@v1.0.1";
 const TOOLBOX = "git:github.com/outmost9271/pi-toolbox";
@@ -205,24 +208,40 @@ test("protected plugins reject disable for both scopes", async () => {
 	assert.match(global.error ?? "", /保护/);
 });
 
-test("plugin completions follow scope, state and protection", () => {
+test("extensions completions follow scope, explicit overrides and protection", () => {
 	const plugins = [
 		{ id: "pi-setmodel", protected: true, global: "enabled", project: "inherit", effective: "enabled" },
 		{ id: "pi-browser", protected: false, global: "enabled", project: "disabled", effective: "disabled" },
 		{ id: "pi-other", protected: false, global: "enabled", project: "inherit", effective: "enabled" },
 	];
-	const completions = (prefix) => getPluginCompletions(prefix, plugins)?.map((item) => item.value) ?? null;
-	assert.deepEqual(completions("plugin enable "), ["plugin enable pi-browser"]);
-	assert.deepEqual(completions("plugin disable "), ["plugin disable pi-other"]);
-	assert.deepEqual(completions("plugin inherit "), ["plugin inherit pi-browser"]);
-	assert.deepEqual(completions("plugin global disable "), [
-		"plugin global disable pi-browser",
-		"plugin global disable pi-other",
+	const completions = (prefix) => getToolboxCompletions(prefix, (_category, scope, action) =>
+		getPluginCompletionCandidates(scope, action, plugins),
+	)?.map((item) => item.value) ?? null;
+	assert.deepEqual(completions("extensions enable "), [
+		"extensions enable pi-setmodel", "extensions enable pi-browser", "extensions enable pi-other",
 	]);
-	assert.equal(completions("plugin global enable "), null);
-	assert.equal(completions("plugin status"), null);
-	assert.deepEqual(completions("plugins "), ["plugins status", "plugins list"]);
-	assert.ok(completions("plugin")?.includes("plugin enable "));
+	assert.deepEqual(completions("extensions disable "), ["extensions disable pi-other"]);
+	assert.deepEqual(completions("extensions inherit "), ["extensions inherit pi-browser"]);
+	assert.deepEqual(completions("extensions global disable "), [
+		"extensions global disable pi-browser",
+		"extensions global disable pi-other",
+	]);
+	assert.equal(completions("extensions global enable "), null);
+	assert.deepEqual(completions("extensions status pi-br"), ["extensions status pi-browser"]);
+	assert.equal(completions("plugin enable "), null);
+	assert.equal(completions("plugins "), null);
+});
+
+test("global extension status does not display project effective state", () => {
+	const plugin = {
+		id: "browser", source: BROWSER, protected: false,
+		global: "disabled", project: "enabled", effective: "enabled",
+		resources: [], resourceWarnings: [],
+	};
+	assert.match(formatPluginsList([plugin]), /^● browser — 项目启用$/);
+	assert.match(formatPluginsList([plugin], "global"), /^○ browser — 全局禁用$/);
+	assert.match(formatPluginDetail(plugin), /^● browser\n/);
+	assert.match(formatPluginDetail(plugin, "global"), /^○ browser\n/);
 });
 
 test("invalid settings files block writes", async () => {

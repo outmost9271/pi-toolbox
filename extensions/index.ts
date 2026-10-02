@@ -21,14 +21,23 @@ import {
 	findPlugin,
 	formatPluginDetail,
 	formatPluginsList,
-	getPluginCompletions,
+	getPluginCompletionCandidates,
 	loadPluginInfo,
-	PLUGIN_COMMAND_NAMES,
 	setGlobalPluginState,
 	setProjectPluginState,
 	type PluginAction,
 	type PluginInfo,
 } from "./plugins.ts";
+import {
+	getToolboxCompletions,
+	parseToolboxCommand,
+	TOOLBOX_CATEGORIES,
+	TOOLBOX_HELP,
+	type ConfigScope,
+	type ToolboxAction as ConfigAction,
+	type ToolboxCategory,
+	type ToolboxCommand,
+} from "./commands.ts";
 
 const TOOLBOX_ROOT = process.env.PI_TOOLBOX_ROOT ?? "/agent-pi/tools";
 const CONFIG_FILE_NAME = "toolbox.json";
@@ -36,8 +45,6 @@ const MANIFEST_FILE_NAME = "manifest.json";
 const CAPABILITY_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 type ProjectOverride = "enabled" | "disabled";
-type ConfigScope = "project" | "global";
-type ConfigAction = "list" | "status" | "enable" | "disable" | "inherit";
 
 interface CapabilityManifest {
 	id: string;
@@ -433,16 +440,6 @@ function formatProjectStatus(
 	return lines.join("\n");
 }
 
-function actionsForScope(scope: ConfigScope): ConfigAction[] {
-	return scope === "global"
-		? ["list", "status", "enable", "disable"]
-		: ["list", "status", "enable", "disable", "inherit"];
-}
-
-function actionNeedsCapability(action: ConfigAction): boolean {
-	return action === "enable" || action === "disable" || action === "inherit";
-}
-
 function completionCandidates(
 	scope: ConfigScope,
 	action: ConfigAction,
@@ -461,39 +458,6 @@ function completionCandidates(
 	return [];
 }
 
-function completeActions(prefix: string, scope: ConfigScope, valuePrefix: string): AutocompleteItem[] | null {
-	const matches = actionsForScope(scope).filter((action) => action.startsWith(prefix));
-	return matches.length > 0
-		? matches.map((action) => ({
-				value: `${valuePrefix}${action}${actionNeedsCapability(action) ? " " : ""}`,
-				label: action,
-			}))
-		: null;
-}
-
-function completeCapabilities(
-	scope: ConfigScope,
-	action: ConfigAction,
-	query: string,
-	capabilities: Capability[],
-	globalEnabled: ReadonlySet<string>,
-	projectOverrides: ReadonlyMap<string, ProjectOverride>,
-	valuePrefix: string,
-): AutocompleteItem[] | null {
-	const normalizedQuery = query.trim().toLowerCase();
-	const filtered = completionCandidates(scope, action, capabilities, globalEnabled, projectOverrides).filter(
-		(capability) =>
-			`${capability.id} ${capability.name} ${capability.description}`.toLowerCase().includes(normalizedQuery),
-	);
-	return filtered.length > 0
-		? filtered.map((capability) => ({
-				value: `${valuePrefix}${action} ${capability.id}`,
-				label: capability.id,
-				description: capability.description,
-			}))
-		: null;
-}
-
 function getToolboxArgumentCompletions(
 	argumentPrefix: string,
 	capabilities: Capability[],
@@ -501,56 +465,14 @@ function getToolboxArgumentCompletions(
 	projectOverrides: ReadonlyMap<string, ProjectOverride>,
 	plugins: PluginInfo[] = [],
 ): AutocompleteItem[] | null {
-	const pluginItems = getPluginCompletions(argumentPrefix, plugins);
-	if (pluginItems && pluginItems.length > 0) return pluginItems;
-	// Match command parsing while retaining a trailing separator for chained completion.
-	// Keep the provider's original prefix unchanged so insertion replaces the full input.
-	argumentPrefix = argumentPrefix.replace(/^[ \t]+/, "").replace(/[ \t]+/g, " ");
-	if (!argumentPrefix.includes(" ")) {
-		const query = argumentPrefix.trim();
-		const topLevel = ["project", "global", ...actionsForScope("project"), ...PLUGIN_COMMAND_NAMES].filter((value) =>
-			value.startsWith(query),
-		);
-		return topLevel.length > 0
-			? topLevel.map((value) => ({
-					value: `${value}${value === "project" || value === "global" || PLUGIN_COMMAND_NAMES.includes(value) || actionNeedsCapability(value as ConfigAction) ? " " : ""}`,
-					label: value,
-				}))
-			: null;
-	}
-
-	const scopedMatch = argumentPrefix.match(/^(project|global)\s+(.*)$/);
-	if (scopedMatch) {
-		const scope = scopedMatch[1] as ConfigScope;
-		const remainder = scopedMatch[2];
-		const valuePrefix = `${scope} `;
-		if (!remainder.includes(" ")) return completeActions(remainder.trim(), scope, valuePrefix);
-		const actionMatch = remainder.match(/^(enable|disable|inherit)\s+(.*)$/);
-		if (!actionMatch) return null;
-		const action = actionMatch[1] as ConfigAction;
-		if (scope === "global" && action === "inherit") return null;
-		return completeCapabilities(
-			scope,
-			action,
-			actionMatch[2],
-			capabilities,
-			globalEnabled,
-			projectOverrides,
-			valuePrefix,
-		);
-	}
-
-	const legacyMatch = argumentPrefix.match(/^(enable|disable|inherit)\s+(.*)$/);
-	if (!legacyMatch) return null;
-	return completeCapabilities(
-		"project",
-		legacyMatch[1] as ConfigAction,
-		legacyMatch[2],
-		capabilities,
-		globalEnabled,
-		projectOverrides,
-		"",
-	);
+	return getToolboxCompletions(argumentPrefix, (category, scope, action) => {
+		if (category === "extensions") return getPluginCompletionCandidates(scope, action, plugins);
+		return completionCandidates(scope, action, capabilities, globalEnabled, projectOverrides).map((capability) => ({
+			id: capability.id,
+			searchText: `${capability.id} ${capability.name} ${capability.description}`,
+			description: capability.description,
+		}));
+	});
 }
 
 function getToolboxArgumentPrefix(lines: string[], cursorLine: number, cursorCol: number): string | undefined {
@@ -674,42 +596,28 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		await ctx.reload();
 	}
 
-	async function handlePluginsCommand(tokens: string[], ctx: ExtensionCommandContext): Promise<void> {
-		if (tokens.length > 1 || (tokens[0] && !["status", "list"].includes(tokens[0]))) {
-			ctx.ui.notify("用法：/toolbox plugins [status|list]", "error");
-			return;
-		}
-		ctx.ui.notify([formatPluginsList(pluginInfos), ...pluginWarnings].filter(Boolean).join("\n"), "info");
+	function showCategoryStatus(category: ToolboxCategory, scope: ConfigScope, ctx: ExtensionCommandContext): void {
+		const status = category === "extensions"
+			? [formatPluginsList(pluginInfos, scope), ...pluginWarnings].filter(Boolean).join("\n")
+			: scope === "global"
+				? formatGlobalStatus(capabilities, globalEnabledIds)
+				: formatProjectStatus(capabilities, globalEnabledIds, projectOverrides);
+		ctx.ui.notify(status, "info");
 	}
 
-	async function handlePluginCommand(tokens: string[], ctx: ExtensionCommandContext): Promise<void> {
-		let scope: ConfigScope = "project";
-		if (tokens[0] === "global") {
-			scope = "global";
-			tokens = tokens.slice(1);
-		}
-		const actions = scope === "global" ? ["status", "enable", "disable"] : ["status", "enable", "disable", "inherit"];
-		const action = tokens[0];
-		if (!action || !actions.includes(action) || tokens.length > 2) {
-			ctx.ui.notify("用法：/toolbox plugin [global] [status|enable|disable|inherit] [<插件>]", "error");
+	async function handleExtensionCommand(command: ToolboxCommand, ctx: ExtensionCommandContext): Promise<void> {
+		const { scope, action, id: pluginId } = command;
+		if (action === "status" && !pluginId) {
+			showCategoryStatus("extensions", scope, ctx);
 			return;
 		}
-		if (action === "status" && !tokens[1]) {
-			ctx.ui.notify([formatPluginsList(pluginInfos), ...pluginWarnings].filter(Boolean).join("\n"), "info");
-			return;
-		}
-		const pluginId = tokens[1];
-		if (!pluginId) {
-			ctx.ui.notify(`/toolbox plugin ${scope === "global" ? "global " : ""}${action} 需要插件名称`, "error");
-			return;
-		}
-		const plugin = findPlugin(pluginInfos, pluginId);
+		const plugin = pluginId ? findPlugin(pluginInfos, pluginId) : undefined;
 		if (!plugin) {
 			ctx.ui.notify(`未知插件：${pluginId}`, "error");
 			return;
 		}
 		if (action === "status") {
-			ctx.ui.notify(formatPluginDetail(plugin), "info");
+			ctx.ui.notify(formatPluginDetail(plugin, scope), "info");
 			return;
 		}
 		const result =
@@ -726,7 +634,7 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		const actionLabel = action === "enable" ? "启用" : action === "disable" ? "禁用" : "恢复继承";
-		ctx.ui.notify(`${pluginId} 已${scope === "global" ? "全局" : "项目"}${actionLabel}；重启 pi 后生效`, "info");
+		ctx.ui.notify(`${pluginId} 已${scope === "global" ? "全局" : "项目"}${actionLabel}；重新加载后生效`, "info");
 		await ctx.reload();
 	}
 
@@ -843,16 +751,16 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		if (!mapsEqual(initial, selected)) await persistProjectAndReload(ctx, selected);
 	}
 
-	async function showScopeSelector(ctx: ExtensionCommandContext): Promise<void> {
+	async function showCategorySelector(ctx: ExtensionCommandContext): Promise<void> {
 		if (ctx.mode !== "tui") {
-			ctx.ui.notify("/toolbox 不带参数时需要 TUI 模式", "error");
+			ctx.ui.notify(TOOLBOX_HELP, "info");
 			return;
 		}
-		const projectChoice = "当前项目（覆盖全局）";
-		const globalChoice = "全局（所有项目默认值）";
-		const selected = await ctx.ui.select("选择 Toolbox 配置范围", [projectChoice, globalChoice]);
-		if (selected === projectChoice) await showProjectSelector(ctx);
-		else if (selected === globalChoice) await showGlobalSelector(ctx);
+		const selected = await ctx.ui.select("选择 Toolbox 分类", [...TOOLBOX_CATEGORIES]);
+		if (!TOOLBOX_CATEGORIES.includes(selected as ToolboxCategory)) return;
+		await refreshState(ctx.cwd);
+		recomputeEffective();
+		showCategoryStatus(selected as ToolboxCategory, "project", ctx);
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -890,7 +798,7 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("toolbox", {
-		description: "配置全局能力默认值和当前项目覆盖",
+		description: "管理 skills 技能能力与 extensions 插件扩展",
 		getArgumentCompletions: (argumentPrefix) =>
 			getToolboxArgumentCompletions(
 				argumentPrefix,
@@ -902,53 +810,33 @@ export default function toolboxExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const input = args.trim();
 			if (!input) {
-				await showScopeSelector(ctx);
+				await showCategorySelector(ctx);
 				return;
 			}
 
+			const command = parseToolboxCommand(input);
+			if (!command) {
+				ctx.ui.notify(TOOLBOX_HELP, "error");
+				return;
+			}
 			await refreshState(ctx.cwd);
 			recomputeEffective();
-			const tokens = input.split(/\s+/);
-			if (tokens[0] === "plugins") {
-				await handlePluginsCommand(tokens.slice(1), ctx);
+			if (command.category === "extensions") {
+				await handleExtensionCommand(command, ctx);
 				return;
 			}
-			if (tokens[0] === "plugin") {
-				await handlePluginCommand(tokens.slice(1), ctx);
+			const { scope, action } = command;
+			if (action === "status") {
+				showCategoryStatus("skills", scope, ctx);
 				return;
 			}
-			let scope: ConfigScope = "project";
-			if (tokens[0] === "project" || tokens[0] === "global") scope = tokens.shift() as ConfigScope;
-			if (tokens.length === 0) {
+			if (action === "config") {
 				if (scope === "global") await showGlobalSelector(ctx);
 				else await showProjectSelector(ctx);
 				return;
 			}
 
-			const action = tokens.shift() as ConfigAction;
-			if (!actionsForScope(scope).includes(action) || tokens.length > (actionNeedsCapability(action) ? 1 : 0)) {
-				ctx.ui.notify(
-					"用法：/toolbox [project|global] [list|status|enable <能力>|disable <能力>|inherit <能力>]",
-					"error",
-				);
-				return;
-			}
-
-			if (action === "list" || action === "status") {
-				ctx.ui.notify(
-					scope === "global"
-						? formatGlobalStatus(capabilities, globalEnabledIds)
-						: formatProjectStatus(capabilities, globalEnabledIds, projectOverrides),
-					"info",
-				);
-				return;
-			}
-
-			const capabilityId = tokens[0];
-			if (!capabilityId) {
-				ctx.ui.notify(`/toolbox ${scope} ${action} 需要能力名称`, "error");
-				return;
-			}
+			const capabilityId = command.id as string;
 			if (!capabilities.some((capability) => capability.id === capabilityId)) {
 				ctx.ui.notify(`未知能力：${capabilityId}`, "error");
 				return;

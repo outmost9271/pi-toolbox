@@ -12,6 +12,7 @@
 
 import { chmod, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import type { CompletionObject, ConfigScope, ToolboxAction } from "./commands.ts";
 
 export type PluginResourceKind = "extensions" | "skills" | "prompts" | "themes";
 export type PluginState = "enabled" | "disabled" | "partial" | "custom";
@@ -19,7 +20,6 @@ export type PluginProjectState = "inherit" | PluginState;
 export type PluginAction = "enable" | "disable" | "inherit";
 
 export const PLUGIN_RESOURCE_KINDS: readonly PluginResourceKind[] = ["extensions", "skills", "prompts", "themes"];
-export const PLUGIN_COMMAND_NAMES: readonly string[] = ["plugin", "plugins"];
 export const PROJECT_DIR_NAME = ".pi";
 export const SETTINGS_FILE_NAME = "settings.json";
 export const PROTECTED_PLUGIN_IDS: readonly string[] = ["pi-toolbox", "pi-setmodel"];
@@ -37,12 +37,6 @@ const CONVENTIONAL_DIRS: Record<PluginResourceKind, string> = {
 	prompts: "prompts",
 	themes: "themes",
 };
-
-export interface CompletionItem {
-	value: string;
-	label: string;
-	description?: string;
-}
 
 export interface PluginResource {
 	kind: PluginResourceKind;
@@ -743,16 +737,21 @@ function projectStateLabel(plugin: PluginInfo): string {
 	return stateLabel(plugin.project, "project");
 }
 
-export function formatPluginsList(plugins: PluginInfo[]): string {
+export function formatPluginsList(plugins: PluginInfo[], scope: ConfigScope = "project"): string {
 	if (plugins.length === 0) return "未在全局 settings 中发现任何插件";
 	return plugins
-		.map((plugin) => `${stateSymbol(plugin.effective)} ${plugin.id}${plugin.protected ? " [保护]" : ""} — ${projectStateLabel(plugin)}`)
+		.map((plugin) => {
+			const state = scope === "global" ? plugin.global : plugin.effective;
+			const label = scope === "global" ? stateLabel(plugin.global, "global") : projectStateLabel(plugin);
+			return `${stateSymbol(state)} ${plugin.id}${plugin.protected ? " [保护]" : ""} — ${label}`;
+		})
 		.join("\n");
 }
 
-export function formatPluginDetail(plugin: PluginInfo): string {
+export function formatPluginDetail(plugin: PluginInfo, scope: ConfigScope = "project"): string {
+	const state = scope === "global" ? plugin.global : plugin.effective;
 	const lines = [
-		`${stateSymbol(plugin.effective)} ${plugin.id}${plugin.protected ? " [保护]" : ""}`,
+		`${stateSymbol(state)} ${plugin.id}${plugin.protected ? " [保护]" : ""}`,
 		`source: ${plugin.source}`,
 		`${stateLabel(plugin.global, "global")} · ${projectStateLabel(plugin)} · ${stateLabel(plugin.effective, "effective")}`,
 	];
@@ -774,58 +773,23 @@ export function findPlugin(plugins: PluginInfo[], id: string): PluginInfo | unde
 	return plugins.find((plugin) => plugin.id === id);
 }
 
-const PROJECT_PLUGIN_ACTIONS = ["status", "enable", "disable", "inherit", "global"];
-const GLOBAL_PLUGIN_ACTIONS = ["status", "enable", "disable"];
-
-export function getPluginCompletions(argumentPrefix: string, plugins: PluginInfo[]): CompletionItem[] | null {
-	const normalized = argumentPrefix.replace(/^[ \t]+/, "").replace(/[ \t]+/g, " ");
-	if (!/^plugins?(\s|$)/.test(normalized)) return null;
-	const parts = normalized.split(" ");
-	if (parts[0] === "plugins") {
-		if (parts.length === 1) return [{ value: "plugins ", label: "plugins" }];
-		const query = parts[1] as string;
-		const matches = ["status", "list"].filter((value) => value.startsWith(query));
-		return matches.length > 0 ? matches.map((value) => ({ value: `plugins ${value}`, label: value })) : null;
-	}
-	if (parts.length === 1 || (parts.length === 2 && parts[1] === "")) {
-		return PROJECT_PLUGIN_ACTIONS.map((value) => ({
-			value: `plugin ${value}${value === "status" ? "" : " "}`,
-			label: value,
-		}));
-	}
-	if (parts[1] === "global") {
-		if (parts.length <= 3 && (parts.length === 2 || parts[2] === "")) {
-			return GLOBAL_PLUGIN_ACTIONS.map((value) => ({
-				value: `plugin global ${value}${value === "status" ? "" : " "}`,
-				label: value,
-			}));
-		}
-		const action = parts[2] as "status" | "enable" | "disable";
-		if (action === "status") return null;
-		const candidates = plugins
-			.filter((plugin) => {
-				if (action === "disable") return !plugin.protected && plugin.global !== "disabled";
-				return plugin.global !== "enabled";
-			})
-			.map((plugin) => ({
-				value: `plugin global ${action} ${plugin.id}`,
-				label: plugin.id,
-				description: plugin.protected ? "受保护" : undefined,
-			}));
-		return candidates.length > 0 ? candidates : null;
-	}
-	const action = parts[1] as "status" | "enable" | "disable" | "inherit";
-	if (action === "status") return null;
-	const candidates = plugins
+export function getPluginCompletionCandidates(
+	scope: ConfigScope,
+	action: ToolboxAction,
+	plugins: PluginInfo[],
+): CompletionObject[] {
+	return plugins
 		.filter((plugin) => {
-			if (action === "disable") return !plugin.protected && plugin.effective !== "disabled";
-			if (action === "enable") return plugin.effective !== "enabled";
-			return plugin.project !== "inherit";
+			if (action === "status") return true;
+			const state = scope === "global" ? plugin.global : plugin.project;
+			if (action === "disable") return !plugin.protected && state !== "disabled";
+			if (action === "enable") return state !== "enabled";
+			if (action === "inherit") return scope === "project" && plugin.project !== "inherit";
+			return false;
 		})
 		.map((plugin) => ({
-			value: `plugin ${action} ${plugin.id}`,
-			label: plugin.id,
+			id: plugin.id,
+			searchText: `${plugin.id} ${plugin.source}`,
 			description: plugin.protected ? "受保护" : undefined,
 		}));
-	return candidates.length > 0 ? candidates : null;
 }
